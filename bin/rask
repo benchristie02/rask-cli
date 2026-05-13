@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-VERSION="0.1.2"
+VERSION="0.1.3"
 DEFAULT_API_URL="https://rask-561465842742.australia-southeast2.run.app"
 CRED_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rask"
 CRED_FILE="$CRED_DIR/credentials"
@@ -107,6 +107,7 @@ Options:
   --prompt-stdin             Read the system prompt for Claude from stdin.
   --prompt-file <PATH>       Read the system prompt from a file.
   --prompt <STRING>          Inline prompt (small prompts only).
+  --copy                     Also copy chapters to the system clipboard (pbcopy).
   --keep                     Keep the downloaded audio file on exit.
   --json                     Print the full JSON response instead of just the chapters.
 
@@ -114,14 +115,17 @@ Prompt sources are optional. If you omit them, the server uses its built-in
 default chapter prompt (10–15 chapters, sponsor-merge rule, etc.).
 
 Examples:
-  # Use the server's default prompt
+  # Default prompt, chapters print to terminal
   rask chapters "https://youtu.be/abc123"
 
+  # Default prompt, also copy to clipboard
+  rask chapters "https://youtu.be/abc123" --copy
+
   # Custom prompt from a file
-  rask chapters "https://youtu.be/abc123" --prompt-file ~/prompts/chapters.txt
+  rask chapters "https://youtu.be/abc123" --prompt-file ~/prompts/chapters.txt --copy
 
   # Custom prompt piped on stdin (heredoc-friendly)
-  pbpaste | rask chapters "https://youtu.be/abc123" --prompt-stdin
+  pbpaste | rask chapters "https://youtu.be/abc123" --prompt-stdin --copy
 EOF
 }
 
@@ -131,6 +135,7 @@ cmd_chapters() {
   local prompt_source=""
   local keep=0
   local json_out=0
+  local do_copy=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -150,6 +155,7 @@ cmd_chapters() {
         prompt="$2"
         prompt_source="inline"
         shift 2 ;;
+      --copy) do_copy=1; shift ;;
       --keep) keep=1; shift ;;
       --json) json_out=1; shift ;;
       --) shift; break ;;
@@ -198,29 +204,36 @@ cmd_chapters() {
     RASK_TMPDIR=""
   fi
 
+  local started=$SECONDS
+
   local audio="$tmp/audio.m4a"
-  log "downloading audio (yt-dlp)..."
+  log "[1/3] downloading audio with yt-dlp..."
   # worstaudio keeps the file small (Deepgram doesn't need quality, and the
-  # endpoint caps at 32 MiB).
+  # endpoint caps at 32 MiB). Redirect yt-dlp output to stderr so it can't
+  # contaminate stdout if the caller pipes us.
   yt-dlp \
-    --quiet --no-warnings \
+    --no-warnings \
+    --newline \
     -f worstaudio \
     -o "$audio" \
     -- "$url" \
+    1>&2 \
     || die "yt-dlp failed"
 
   [[ -s "$audio" ]] || die "yt-dlp produced empty audio"
 
   local size
   size=$(wc -c < "$audio" | tr -d '[:space:]')
-  log "uploading $(($size / 1024)) KiB to $(api_url)/api/youtube-chapters..."
+  local size_mib
+  size_mib=$(awk "BEGIN { printf \"%.1f\", $size / 1024 / 1024 }")
+  log "      downloaded ${size_mib} MiB in $((SECONDS - started))s"
 
   # Build the multipart args. We omit the prompt field entirely when none was
   # supplied — the server falls back to its built-in default chapters prompt.
   # curl's `-F "prompt=<file"` form streams the prompt from disk; this avoids
   # passing it on the argv (visible in `ps`) and sidesteps shell quoting issues.
   local curl_args=(
-    -sS
+    -S --progress-bar
     -X POST
     -H "Authorization: Bearer $token"
     -F "audio=@$audio;type=audio/mp4"
@@ -231,10 +244,17 @@ cmd_chapters() {
     curl_args+=(-F "prompt=<$tmp/prompt.txt")
   fi
 
+  log "[2/3] uploading ${size_mib} MiB..."
   local response_file="$tmp/response.json"
+  local upload_started=$SECONDS
   local http_code
   http_code=$(curl "${curl_args[@]}" -o "$response_file" -w '%{http_code}' \
     "$(api_url)/api/youtube-chapters")
+  log "      upload finished in $((SECONDS - upload_started))s"
+  log "[3/3] server transcribing (Deepgram) and writing chapters (Claude)..."
+  # NB: curl --progress-bar shows the upload phase only. The subsequent server-
+  # side work runs synchronously inside that same HTTP call, so there's nothing
+  # to display during the 30s-per-10min of audio it takes — just a quiet wait.
 
   if [[ "$http_code" != "200" ]]; then
     local msg
@@ -242,11 +262,33 @@ cmd_chapters() {
     die "HTTP $http_code: $msg"
   fi
 
+  local total=$((SECONDS - started))
+  log "      done in ${total}s total"
+
+  # Render the result.
+  local body
   if [[ "$json_out" -eq 1 ]]; then
-    cat "$response_file"
+    body=$(cat "$response_file")
   else
-    jq -r '.data.chapters' < "$response_file"
+    body=$(jq -r '.data.chapters' < "$response_file")
   fi
+
+  if [[ "$do_copy" -eq 1 ]]; then
+    if command -v pbcopy >/dev/null 2>&1; then
+      printf '%s' "$body" | pbcopy
+    elif command -v xclip >/dev/null 2>&1; then
+      printf '%s' "$body" | xclip -selection clipboard
+    elif command -v wl-copy >/dev/null 2>&1; then
+      printf '%s' "$body" | wl-copy
+    else
+      die "--copy requested but no clipboard tool found (need pbcopy, xclip, or wl-copy)"
+    fi
+    local count
+    count=$(printf '%s\n' "$body" | grep -cE '^[[:space:]]*[0-9]+:' || true)
+    log "✓ chapters copied to clipboard${count:+ ($count entries)}"
+  fi
+
+  printf '%s\n' "$body"
 }
 
 # ---- dispatch --------------------------------------------------------------
