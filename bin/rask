@@ -22,10 +22,22 @@
 
 set -euo pipefail
 
-VERSION="0.1.1"
+VERSION="0.1.2"
 DEFAULT_API_URL="https://rask-561465842742.australia-southeast2.run.app"
 CRED_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rask"
 CRED_FILE="$CRED_DIR/credentials"
+
+# Script-level scratch dir for `chapters`. Kept at script scope (not local) so
+# the EXIT trap can reach it after the function frame has unwound — referencing
+# a `local` variable from the trap blows up under `set -u`.
+RASK_TMPDIR=""
+
+cleanup_tmpdir() {
+  if [[ -n "${RASK_TMPDIR:-}" && -d "$RASK_TMPDIR" ]]; then
+    rm -rf "$RASK_TMPDIR"
+  fi
+}
+trap cleanup_tmpdir EXIT
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -178,12 +190,12 @@ cmd_chapters() {
   local token
   token="$(load_token)" || die "no token configured. Run \`rask login\` first."
 
-  local tmp
-  tmp="$(mktemp -d -t rask.XXXXXX)"
-  if [[ "$keep" -eq 0 ]]; then
-    trap 'rm -rf "$tmp"' EXIT
-  else
+  RASK_TMPDIR="$(mktemp -d -t rask.XXXXXX)"
+  local tmp="$RASK_TMPDIR"
+  if [[ "$keep" -eq 1 ]]; then
+    # Suppress the EXIT cleanup by clearing the global the trap checks.
     log "keeping temp dir: $tmp"
+    RASK_TMPDIR=""
   fi
 
   local audio="$tmp/audio.m4a"
