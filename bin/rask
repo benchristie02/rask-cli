@@ -1,0 +1,252 @@
+#!/usr/bin/env bash
+# rask — internal CLI for Rask Australia.
+#
+# Subcommands:
+#   rask login                     Store an API token at ~/.config/rask/credentials.
+#   rask chapters <URL>            Download a YouTube video locally, upload the
+#                                  audio to /api/youtube-chapters, print chapters
+#                                  to stdout.
+#   rask logout                    Forget the stored token.
+#   rask whoami                    Print the configured API base URL.
+#   rask --help | rask <cmd> --help
+#
+# Environment overrides:
+#   RASK_API_URL    Base URL of the rask app. Default: production Cloud Run URL.
+#   RASK_TOKEN      Bearer token. Overrides the stored credentials file.
+#
+# Dependencies (provided by the Homebrew formula):
+#   yt-dlp, jq, curl
+#
+# Note: ffmpeg is NOT required client-side. Audio transcoding happens on the
+# server. yt-dlp emits whatever container YouTube serves; the server normalises.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+DEFAULT_API_URL="https://rask-561465842742.australia-southeast2.run.app"
+CRED_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rask"
+CRED_FILE="$CRED_DIR/credentials"
+
+# ---- helpers ---------------------------------------------------------------
+
+die() { printf 'rask: %s\n' "$*" >&2; exit 1; }
+log() { printf 'rask: %s\n' "$*" >&2; }
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1. Install with \`brew install $1\`."
+}
+
+api_url() {
+  printf '%s' "${RASK_API_URL:-$DEFAULT_API_URL}"
+}
+
+load_token() {
+  if [[ -n "${RASK_TOKEN:-}" ]]; then
+    printf '%s' "$RASK_TOKEN"
+    return 0
+  fi
+  if [[ -r "$CRED_FILE" ]]; then
+    # File format: a single line containing the token. Tolerate trailing
+    # whitespace from `pbpaste`/manual edits.
+    tr -d '[:space:]' < "$CRED_FILE"
+    return 0
+  fi
+  return 1
+}
+
+# ---- subcommands -----------------------------------------------------------
+
+cmd_login() {
+  mkdir -p "$CRED_DIR"
+  chmod 700 "$CRED_DIR"
+  printf 'Paste your rask API token (input hidden): ' >&2
+  local token
+  IFS= read -rs token
+  printf '\n' >&2
+  [[ -n "$token" ]] || die "empty token, aborting"
+  umask 077
+  printf '%s\n' "$token" > "$CRED_FILE"
+  log "saved token to $CRED_FILE"
+}
+
+cmd_logout() {
+  if [[ -f "$CRED_FILE" ]]; then
+    rm -f "$CRED_FILE"
+    log "removed $CRED_FILE"
+  else
+    log "no stored credentials"
+  fi
+}
+
+cmd_whoami() {
+  printf 'api_url:   %s\n' "$(api_url)"
+  if load_token >/dev/null 2>&1; then
+    printf 'token:     stored (%s)\n' "$([[ -n "${RASK_TOKEN:-}" ]] && echo "from env" || echo "from $CRED_FILE")"
+  else
+    printf 'token:     none — run `rask login`\n'
+  fi
+}
+
+usage_chapters() {
+  cat >&2 <<'EOF'
+Usage: rask chapters <YOUTUBE_URL> [options]
+
+Options:
+  --prompt-stdin             Read the system prompt for Claude from stdin.
+  --prompt-file <PATH>       Read the system prompt from a file.
+  --prompt <STRING>          Inline prompt (small prompts only).
+  --keep                     Keep the downloaded audio file on exit.
+  --json                     Print the full JSON response instead of just the chapters.
+
+Exactly one of --prompt-stdin, --prompt-file, or --prompt is required.
+
+Examples:
+  rask chapters "https://youtu.be/abc123" --prompt-file ~/prompts/chapters.txt
+  pbpaste | rask chapters "https://youtu.be/abc123" --prompt-stdin
+EOF
+}
+
+cmd_chapters() {
+  local url=""
+  local prompt=""
+  local prompt_source=""
+  local keep=0
+  local json_out=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) usage_chapters; return 0 ;;
+      --prompt-stdin)
+        [[ -z "$prompt_source" ]] || die "only one prompt source allowed"
+        prompt_source="stdin"
+        shift ;;
+      --prompt-file)
+        [[ -z "$prompt_source" ]] || die "only one prompt source allowed"
+        [[ $# -ge 2 ]] || die "--prompt-file requires a path"
+        prompt_source="file:$2"
+        shift 2 ;;
+      --prompt)
+        [[ -z "$prompt_source" ]] || die "only one prompt source allowed"
+        [[ $# -ge 2 ]] || die "--prompt requires a value"
+        prompt="$2"
+        prompt_source="inline"
+        shift 2 ;;
+      --keep) keep=1; shift ;;
+      --json) json_out=1; shift ;;
+      --) shift; break ;;
+      -*) die "unknown flag: $1" ;;
+      *)
+        [[ -z "$url" ]] || die "unexpected extra argument: $1"
+        url="$1"
+        shift ;;
+    esac
+  done
+
+  [[ -n "$url" ]] || { usage_chapters; exit 2; }
+  [[ -n "$prompt_source" ]] || die "a prompt is required (--prompt-stdin, --prompt-file, or --prompt)"
+
+  case "$prompt_source" in
+    stdin)
+      prompt="$(cat)"
+      ;;
+    file:*)
+      local path="${prompt_source#file:}"
+      [[ -r "$path" ]] || die "cannot read prompt file: $path"
+      prompt="$(cat "$path")"
+      ;;
+    inline) : ;;
+  esac
+  [[ -n "${prompt//[[:space:]]/}" ]] || die "prompt is empty"
+
+  require_cmd yt-dlp
+  require_cmd curl
+  require_cmd jq
+
+  local token
+  token="$(load_token)" || die "no token configured. Run \`rask login\` first."
+
+  local tmp
+  tmp="$(mktemp -d -t rask.XXXXXX)"
+  if [[ "$keep" -eq 0 ]]; then
+    trap 'rm -rf "$tmp"' EXIT
+  else
+    log "keeping temp dir: $tmp"
+  fi
+
+  local audio="$tmp/audio.m4a"
+  log "downloading audio (yt-dlp)..."
+  # worstaudio keeps the file small (Deepgram doesn't need quality, and the
+  # endpoint caps at 32 MiB).
+  yt-dlp \
+    --quiet --no-warnings \
+    -f worstaudio \
+    -o "$audio" \
+    -- "$url" \
+    || die "yt-dlp failed"
+
+  [[ -s "$audio" ]] || die "yt-dlp produced empty audio"
+
+  local size
+  size=$(wc -c < "$audio" | tr -d '[:space:]')
+  log "uploading $(($size / 1024)) KiB to $(api_url)/api/youtube-chapters..."
+
+  # curl's `-F "prompt=<file"` form streams the prompt from disk; this avoids
+  # passing it on the argv (visible in `ps`) and sidesteps shell quoting issues.
+  printf '%s' "$prompt" > "$tmp/prompt.txt"
+
+  local response_file="$tmp/response.json"
+  local http_code
+  http_code=$(curl -sS -o "$response_file" -w '%{http_code}' \
+    -X POST \
+    -H "Authorization: Bearer $token" \
+    -F "audio=@$audio;type=audio/mp4" \
+    -F "prompt=<$tmp/prompt.txt" \
+    -F "source_url=$url" \
+    "$(api_url)/api/youtube-chapters")
+
+  if [[ "$http_code" != "200" ]]; then
+    local msg
+    msg=$(jq -r '.error // "request failed"' < "$response_file" 2>/dev/null || cat "$response_file")
+    die "HTTP $http_code: $msg"
+  fi
+
+  if [[ "$json_out" -eq 1 ]]; then
+    cat "$response_file"
+  else
+    jq -r '.data.chapters' < "$response_file"
+  fi
+}
+
+# ---- dispatch --------------------------------------------------------------
+
+usage() {
+  cat >&2 <<EOF
+rask $VERSION — internal CLI for Rask Australia.
+
+Usage: rask <command> [args]
+
+Commands:
+  login        Store an API token.
+  logout       Remove the stored token.
+  whoami       Show current API URL and credential state.
+  chapters     Generate YouTube chapter markers from a video URL.
+  version      Print version.
+  help         Show this message.
+EOF
+}
+
+main() {
+  [[ $# -gt 0 ]] || { usage; exit 2; }
+  local cmd="$1"; shift
+  case "$cmd" in
+    login)    cmd_login    "$@" ;;
+    logout)   cmd_logout   "$@" ;;
+    whoami)   cmd_whoami   "$@" ;;
+    chapters) cmd_chapters "$@" ;;
+    version|--version|-v) printf 'rask %s\n' "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) die "unknown command: $cmd. Try \`rask help\`." ;;
+  esac
+}
+
+main "$@"
