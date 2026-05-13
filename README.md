@@ -28,13 +28,16 @@ Ask whoever owns the rask app for a token if you don't have one.
 ## Use
 
 ```bash
-# Inline prompt
+# Simplest — server uses its built-in default chapters prompt
+rask chapters "https://youtu.be/abc123"
+
+# Inline custom prompt
 rask chapters "https://youtu.be/abc123" --prompt "Return YouTube-style chapter markers, one per line, in MM:SS Title format."
 
-# Prompt from a file (recommended for anything non-trivial)
+# Custom prompt from a file (recommended for anything non-trivial)
 rask chapters "https://youtu.be/abc123" --prompt-file ~/prompts/chapters.txt
 
-# Prompt piped on stdin
+# Custom prompt piped on stdin (heredoc-friendly)
 pbpaste | rask chapters "https://youtu.be/abc123" --prompt-stdin
 ```
 
