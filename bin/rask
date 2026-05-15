@@ -15,14 +15,16 @@
 #   RASK_TOKEN      Bearer token. Overrides the stored credentials file.
 #
 # Dependencies (provided by the Homebrew formula):
-#   yt-dlp, jq, curl
+#   yt-dlp, jq, curl, ffmpeg
 #
-# Note: ffmpeg is NOT required client-side. Audio transcoding happens on the
-# server. yt-dlp emits whatever container YouTube serves; the server normalises.
+# ffmpeg is only used by the local-file path of `rask chapters` (to strip +
+# transcode audio before upload). The YouTube path still does no client-side
+# transcoding — yt-dlp emits whatever container YouTube serves and the server
+# normalises.
 
 set -euo pipefail
 
-VERSION="0.1.4"
+VERSION="0.1.5"
 DEFAULT_API_URL="https://rask-561465842742.australia-southeast2.run.app"
 CRED_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/rask"
 CRED_FILE="$CRED_DIR/credentials"
@@ -101,28 +103,37 @@ cmd_whoami() {
 
 usage_chapters() {
   cat >&2 <<'EOF'
-Usage: rask chapters <YOUTUBE_URL> [options]
+Usage: rask chapters <YOUTUBE_URL | VIDEO_PATH> [options]
+
+The first argument can be either:
+  - a YouTube/video URL (anything starting with http:// or https://). The CLI
+    downloads the audio with yt-dlp and uploads it.
+  - a local file path (video or audio). The CLI uses ffmpeg to strip and
+    transcode to a small mono Opus track, then uploads it.
 
 Options:
   --prompt-stdin             Read the system prompt for Claude from stdin.
   --prompt-file <PATH>       Read the system prompt from a file.
   --prompt <STRING>          Inline prompt (small prompts only).
   --copy                     Also copy chapters to the system clipboard (pbcopy).
-  --keep                     Keep the downloaded audio file on exit.
+  --keep                     Keep the downloaded/transcoded audio file on exit.
   --json                     Print the full JSON response instead of just the chapters.
 
 Prompt sources are optional. If you omit them, the server uses its built-in
 default chapter prompt (10–15 chapters, sponsor-merge rule, etc.).
 
 Examples:
-  # Default prompt, chapters print to terminal
+  # YouTube URL, default prompt, chapters print to terminal
   rask chapters "https://youtu.be/abc123"
 
-  # Default prompt, also copy to clipboard
+  # YouTube URL, default prompt, also copy to clipboard
   rask chapters "https://youtu.be/abc123" --copy
 
-  # Custom prompt from a file
-  rask chapters "https://youtu.be/abc123" --prompt-file ~/prompts/chapters.txt --copy
+  # Local video file
+  rask chapters ~/Movies/episode-42.mov --copy
+
+  # Local file with custom prompt from a file
+  rask chapters ~/Movies/episode-42.mp4 --prompt-file ~/prompts/chapters.txt --copy
 
   # Custom prompt piped on stdin (heredoc-friendly)
   pbpaste | rask chapters "https://youtu.be/abc123" --prompt-stdin --copy
@@ -169,6 +180,21 @@ cmd_chapters() {
 
   [[ -n "$url" ]] || { usage_chapters; exit 2; }
 
+  # Strip a leading shell prompt if the user accidentally copied it along with
+  # their path/URL. Matches:
+  #   zsh default:  user@host dir % rest
+  #   bash default: user@host:dir$  rest
+  # Only rewrites when there is real content after the prompt; a bare prompt
+  # falls through unchanged so the downstream "file not found" / yt-dlp error
+  # still surfaces.
+  if [[ "$url" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+[[:space:]][^%]*%[[:space:]]+(.+)$ ]]; then
+    url="${BASH_REMATCH[1]}"
+    log "stripped a leading shell prompt from input — using: $url"
+  elif [[ "$url" =~ ^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+:[^$]*[$][[:space:]]+(.+)$ ]]; then
+    url="${BASH_REMATCH[1]}"
+    log "stripped a leading shell prompt from input — using: $url"
+  fi
+
   case "$prompt_source" in
     stdin)
       prompt="$(cat)"
@@ -189,9 +215,37 @@ cmd_chapters() {
       ;;
   esac
 
-  require_cmd yt-dlp
+  # Detect input kind from the first positional. URLs are anything with an
+  # http(s) scheme; everything else is treated as a path on disk. The CLI
+  # intentionally doesn't accept file:// URLs — they'd just complicate the
+  # branching for no gain (a path works).
+  local input_kind="url"
+  if [[ ! "$url" =~ ^https?:// ]]; then
+    input_kind="file"
+  fi
+
   require_cmd curl
   require_cmd jq
+  if [[ "$input_kind" == "url" ]]; then
+    require_cmd yt-dlp
+  else
+    require_cmd ffmpeg
+    # Finder drags paths into Terminal with shell-special characters
+    # backslash-escaped (e.g. `BudgetQ\&A`). If the user wraps the drop in
+    # single quotes, those backslashes survive into $1 verbatim and the
+    # literal path won't exist on disk. Recover transparently: if the
+    # literal path is missing but the de-escaped version exists, use it.
+    if [[ ! -e "$url" && "$url" == *\\* ]]; then
+      local unescaped="${url//\\/}"
+      if [[ -e "$unescaped" ]]; then
+        log "removed shell-escape backslashes from path — using: $unescaped"
+        url="$unescaped"
+      fi
+    fi
+    [[ -e "$url" ]] || die "file not found: $url"
+    [[ -r "$url" ]] || die "file not readable: $url"
+    [[ -f "$url" ]] || die "not a regular file: $url"
+  fi
 
   local token
   token="$(load_token)" || die "no token configured. Run \`rask login\` first."
@@ -206,21 +260,44 @@ cmd_chapters() {
 
   local started=$SECONDS
 
-  local audio="$tmp/audio.m4a"
-  log "downloading audio with yt-dlp..."
-  # worstaudio keeps the file small (Deepgram doesn't need quality, and the
-  # endpoint caps at 32 MiB). Redirect yt-dlp output to stderr so it can't
-  # contaminate stdout if the caller pipes us.
-  yt-dlp \
-    --no-warnings \
-    --newline \
-    -f worstaudio \
-    -o "$audio" \
-    -- "$url" \
-    1>&2 \
-    || die "yt-dlp failed"
+  local audio
+  local audio_mime
+  if [[ "$input_kind" == "url" ]]; then
+    audio="$tmp/audio.m4a"
+    audio_mime="audio/mp4"
+    log "downloading audio with yt-dlp..."
+    # worstaudio keeps the file small (Deepgram doesn't need quality, and the
+    # endpoint caps at 32 MiB). Redirect yt-dlp output to stderr so it can't
+    # contaminate stdout if the caller pipes us.
+    yt-dlp \
+      --no-warnings \
+      --newline \
+      -f worstaudio \
+      -o "$audio" \
+      -- "$url" \
+      1>&2 \
+      || die "yt-dlp failed"
 
-  [[ -s "$audio" ]] || die "yt-dlp produced empty audio"
+    [[ -s "$audio" ]] || die "yt-dlp produced empty audio"
+  else
+    audio="$tmp/audio.opus"
+    audio_mime="audio/opus"
+    log "stripping audio with ffmpeg (24k mono Opus)..."
+    # Match the server's normalisation parameters so the server-side re-encode
+    # is effectively a no-op, and the upload stays well under the 32 MiB cap
+    # (≈11 MB for a 60-min episode). Stream-copy isn't viable here because the
+    # source codec is usually AAC/PCM at much higher bitrates.
+    ffmpeg -y -hide_banner -loglevel error \
+      -i "$url" \
+      -vn \
+      -c:a libopus -b:a 24k -ac 1 -ar 16000 \
+      -application voip \
+      "$audio" \
+      1>&2 \
+      || die "ffmpeg failed"
+
+    [[ -s "$audio" ]] || die "ffmpeg produced empty audio"
+  fi
 
   local size
   size=$(wc -c < "$audio" | tr -d '[:space:]')
@@ -232,12 +309,21 @@ cmd_chapters() {
   # supplied — the server falls back to its built-in default chapters prompt.
   # curl's `-F "prompt=<file"` form streams the prompt from disk; this avoids
   # passing it on the argv (visible in `ps`) and sidesteps shell quoting issues.
+  # For local files we ship the basename as the source label — the server only
+  # echoes this in logs, never fetches it.
+  local source_label
+  if [[ "$input_kind" == "url" ]]; then
+    source_label="$url"
+  else
+    source_label="file://$(basename -- "$url")"
+  fi
+
   local curl_args=(
     -sS
     -X POST
     -H "Authorization: Bearer $token"
-    -F "audio=@$audio;type=audio/mp4"
-    -F "source_url=$url"
+    -F "audio=@$audio;type=$audio_mime"
+    -F "source_url=$source_label"
   )
   if [[ -n "$prompt" ]]; then
     printf '%s' "$prompt" > "$tmp/prompt.txt"
@@ -330,7 +416,7 @@ Commands:
   login        Store an API token.
   logout       Remove the stored token.
   whoami       Show current API URL and credential state.
-  chapters     Generate YouTube chapter markers from a video URL.
+  chapters     Generate YouTube chapter markers from a video URL or local file.
   version      Print version.
   help         Show this message.
 EOF
